@@ -24,16 +24,24 @@ Steps:
 # =============================================================================
 # 1. IMPORTS
 # =============================================================================
+
 import os
+
+# Suppress TensorFlow logs
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"     # hides INFO + WARNING
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"    # removes oneDNN message
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 import networkx as nx
 import matplotlib.pyplot as plt
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'   # suppress TF info/warning logs
-print(f"TensorFlow version: {tf.__version__}")
+print("\n============================================================")
+print("NN2Logic Multi-Layer XOR Experiment")
+print("============================================================\n")
 
+print(f"TensorFlow version: {tf.__version__}")
 
 # =============================================================================
 # 2. AC AND NNF DATA STRUCTURES
@@ -227,16 +235,30 @@ def visualize(circuit, var_names=None, title="", filename="graph.png"):
         for inp in n.inputs:
             G.add_edge(inp.id, n.id)
 
-    plt.figure(figsize=(9, 5))
+    fig = plt.figure(figsize=(11, 7))
+    # Leave generous top margin so title never overlaps nodes
+    fig.subplots_adjust(top=0.92, bottom=0.02, left=0.02, right=0.98)
+
+    ax = fig.add_subplot(111)
+
     pos = nx.spring_layout(G, seed=42, k=2)
-    nx.draw(G, pos, labels=labels, node_color=colors, node_size=1200,
-            font_size=9, font_weight='bold', arrows=True, arrowsize=14)
-    plt.title(title, fontsize=10, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(filename, dpi=150, bbox_inches='tight')
+
+    nx.draw(G, pos,
+            ax=ax,
+            labels=labels,
+            node_color=colors,
+            node_size=1200,
+            font_size=9,
+            font_weight='bold',
+            arrows=True,
+            arrowsize=14)
+
+    # Single clean title — no subtitle, no suptitle clash
+    fig.suptitle(title, fontsize=13, fontweight='bold', y=0.98)
+
+    plt.savefig(filename, dpi=150)
     plt.show()
     print(f"  Saved --> {filename}")
-
 
 # =============================================================================
 # 6. TENSORFLOW: DEFINE AND TRAIN MULTI-LAYER FEEDFORWARD NETWORK
@@ -252,22 +274,27 @@ X_train = np.array([[0, 0],
 y_train = np.array([0, 1, 1, 0], dtype=np.float32)   # XOR labels
 
 # Build model: Input(2) --> Hidden(4, ReLU) --> Output(1, Sigmoid)
-tf.random.set_seed(42)
+tf.random.set_seed(7)
+np.random.seed(7)
 
 model = keras.Sequential([
+    keras.Input(shape=(2,), name="input_layer"),
+
     keras.layers.Dense(
         units=4,
-        input_shape=(2,),
         activation='relu',
         use_bias=True,
+        kernel_initializer='he_uniform',
         name='hidden_layer'
     ),
+
     keras.layers.Dense(
         units=1,
         activation='sigmoid',
         use_bias=True,
         name='output_layer'
     )
+
 ], name='nn2logic_feedforward')
 
 model.compile(
@@ -316,18 +343,72 @@ print("\n" + "=" * 60)
 print("✓ Forward propagation verified — all layers producing output.")
 print("=" * 60)
 
-
 # =============================================================================
 # 8. TRAIN THE NETWORK
 # =============================================================================
 
-history = model.fit(X_train, y_train, epochs=2000, verbose=0)
+MAX_ATTEMPTS = 5
 
-final_acc  = history.history['accuracy'][-1]
-final_loss = history.history['loss'][-1]
-print(f"\nTraining complete  |  loss: {final_loss:.4f}  |  accuracy: {final_acc:.4f}")
+early_stop = tf.keras.callbacks.EarlyStopping(
+    monitor='accuracy',
+    mode='max',
+    patience=50,
+    restore_best_weights=True
+)
 
-# Verify final predictions
+for attempt in range(1, MAX_ATTEMPTS + 1):
+    tf.random.set_seed(attempt * 7)
+    np.random.seed(attempt * 7)
+
+    # Re-initialize model weights by rebuilding (seeds change each attempt)
+    for layer in model.layers:
+        if hasattr(layer, 'kernel_initializer'):
+            layer.kernel.assign(layer.kernel_initializer(layer.kernel.shape))
+            layer.bias.assign(layer.bias_initializer(layer.bias.shape))
+
+    history = model.fit(
+        X_train, y_train,
+        epochs=5000,
+        verbose=0,
+        callbacks=[early_stop]
+    )
+
+    # How many epochs actually ran before early stopping kicked in
+    epochs_run = len(history.history['loss'])
+
+    # Option B: best accuracy epoch, and loss at that same epoch
+    acc_hist  = history.history['accuracy']
+    loss_hist = history.history['loss']
+
+    best_idx = int(np.argmax(acc_hist))
+    best_acc = float(acc_hist[best_idx])
+    best_loss_at_best_acc = float(loss_hist[best_idx])
+
+    # (Optional) also keep last-epoch stats for more complete reporting
+    final_acc  = float(acc_hist[-1])
+    final_loss = float(loss_hist[-1])
+
+    print(
+        f"\n[Attempt {attempt}] "
+        f"best_epoch={best_idx+1} "
+        f"best_acc={best_acc:.4f} "
+        f"loss_at_best_acc={best_loss_at_best_acc:.4f}  |  "
+        f"last_epoch={epochs_run} "
+        f"last_acc={final_acc:.4f} "
+        f"last_loss={final_loss:.4f}"
+    )
+    
+    # Convergence check should match restore_best_weights=True
+    if best_acc >= 1.0:
+        print(f"✓ Converged successfully (best epoch = {best_idx + 1}, ran {epochs_run} epochs).")
+        break
+else:
+    raise RuntimeError(
+        f"Training failed to converge after {MAX_ATTEMPTS} attempts. "
+        "Try a different architecture or learning rate."
+    )
+
+# Verify final predictions (these use the restored best weights)
 preds = (model.predict(X_train, verbose=0) >= 0.5).astype(int).flatten()
 print("\nPredictions vs Labels (XOR):")
 for xi, yi, pi in zip(X_train, y_train, preds):
@@ -535,7 +616,7 @@ W_out, b_out   = output_layer.get_weights()   # W_out: (4,1), b_out: (1,)
 def binarized_output_forward(binary_hidden):
     """
     Manually compute output layer using binarized hidden values.
-    Applies sigmoid then thresholds at 0.5 — matching the AC's step function.
+    Applies linear combination then threshold > 0 — matching AC STEP activation.
 
     Args:
         binary_hidden : list of 4 ints (0 or 1)
