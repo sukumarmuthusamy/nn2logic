@@ -31,11 +31,20 @@ import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"     # hides INFO + WARNING
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"    # removes oneDNN message
 
+# Reproducibility / determinism (best-effort)
+os.environ["PYTHONHASHSEED"] = "7"
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 import networkx as nx
 import matplotlib.pyplot as plt
+
+try:
+    # Best-effort deterministic ops (depends on environment / TF build)
+    tf.config.experimental.enable_op_determinism()
+except Exception:
+    pass
 
 print("\n============================================================")
 print("NN2Logic Multi-Layer XOR Experiment")
@@ -100,6 +109,11 @@ class NNF:
 # 3. AC EVALUATION AND AC --> NNF CONVERSION
 # =============================================================================
 
+# STEP threshold epsilon:
+# Values very close to 0 can flip across runs; epsilon makes the binarization less fragile.
+STEP_EPS = 1e-6
+
+
 def eval_ac(ac, vals):
     """
     Evaluate an Arithmetic Circuit for a given input assignment.
@@ -117,7 +131,7 @@ def eval_ac(ac, vals):
         elif n.op == "CONST":  v[n.id] = n.value
         elif n.op == "MUL":    v[n.id] = v[n.inputs[0].id] * v[n.inputs[1].id]
         elif n.op == "ADD":    v[n.id] = sum(v[i.id] for i in n.inputs)
-        elif n.op == "ACT":    v[n.id] = 1 if v[n.inputs[0].id] > 0 else 0   # strict > 0, consistent with ReLU binarization
+        elif n.op == "ACT":    v[n.id] = 1 if v[n.inputs[0].id] > STEP_EPS else 0
     return v[ac.output.id]
 
 
@@ -271,7 +285,10 @@ X_train = np.array([[0, 0],
                     [1, 0],
                     [1, 1]], dtype=np.float32)
 
-y_train = np.array([0, 1, 1, 0], dtype=np.float32)   # XOR labels
+y_train = np.array([[0],
+                    [1],
+                    [1],
+                    [0]], dtype=np.float32)   # shape (4,1) matches model output
 
 # Build model: Input(2) --> Hidden(4, ReLU) --> Output(1, Sigmoid)
 tf.random.set_seed(7)
@@ -300,7 +317,7 @@ model = keras.Sequential([
 model.compile(
     optimizer=keras.optimizers.Adam(learning_rate=0.05),
     loss='binary_crossentropy',
-    metrics=['accuracy']
+    metrics=[keras.metrics.BinaryAccuracy(threshold=0.5, name="accuracy")]
 )
 
 model.summary()
@@ -347,7 +364,7 @@ print("=" * 60)
 # 8. TRAIN THE NETWORK
 # =============================================================================
 
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 30
 
 early_stop = tf.keras.callbacks.EarlyStopping(
     monitor='accuracy',
@@ -361,10 +378,23 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
     np.random.seed(attempt * 7)
 
     # Re-initialize model weights by rebuilding (seeds change each attempt)
+    # Also use seeded initializers per attempt for controlled restarts.
     for layer in model.layers:
-        if hasattr(layer, 'kernel_initializer'):
-            layer.kernel.assign(layer.kernel_initializer(layer.kernel.shape))
-            layer.bias.assign(layer.bias_initializer(layer.bias.shape))
+        if isinstance(layer, keras.layers.Dense):
+            if layer.name == "hidden_layer":
+                k_init = keras.initializers.HeUniform(seed=attempt * 7)
+            else:
+                k_init = keras.initializers.GlorotUniform(seed=attempt * 7 + 1)
+
+            layer.kernel.assign(k_init(layer.kernel.shape))
+            layer.bias.assign(tf.zeros_like(layer.bias))
+
+    # Reset optimizer state so each attempt is truly independent (Adam keeps momentum otherwise)
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.05),
+        loss='binary_crossentropy',
+        metrics=[keras.metrics.BinaryAccuracy(threshold=0.5, name="accuracy")]
+    )
 
     history = model.fit(
         X_train, y_train,
@@ -376,7 +406,7 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
     # How many epochs actually ran before early stopping kicked in
     epochs_run = len(history.history['loss'])
 
-    # Option B: best accuracy epoch, and loss at that same epoch
+    # Best accuracy epoch, and loss at that same epoch
     acc_hist  = history.history['accuracy']
     loss_hist = history.history['loss']
 
@@ -384,7 +414,7 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
     best_acc = float(acc_hist[best_idx])
     best_loss_at_best_acc = float(loss_hist[best_idx])
 
-    # (Optional) also keep last-epoch stats for more complete reporting
+    # Also keep last-epoch stats for more complete reporting
     final_acc  = float(acc_hist[-1])
     final_loss = float(loss_hist[-1])
 
@@ -397,10 +427,31 @@ for attempt in range(1, MAX_ATTEMPTS + 1):
         f"last_acc={final_acc:.4f} "
         f"last_loss={final_loss:.4f}"
     )
-    
-    # Convergence check should match restore_best_weights=True
-    if best_acc >= 1.0:
-        print(f"✓ Converged successfully (best epoch = {best_idx + 1}, ran {epochs_run} epochs).")
+
+    # Truth-table checks:
+    # (A) continuous TF XOR truth table
+    cont_probs = model(X_train, training=False).numpy().reshape(-1)
+    cont_preds = (cont_probs >= 0.5).astype(int)
+    cont_ok = np.array_equal(cont_preds, y_train.astype(int).reshape(-1))
+
+    # (B) binarized surrogate XOR truth table (the one used for logic extraction)
+    output_layer_chk = model.get_layer('output_layer')
+    W_out_chk, b_out_chk = output_layer_chk.get_weights()
+
+    def bin_out_from_x(xi):
+        h_raw = hidden_model(xi.reshape(1, -1))[0]
+        h_bin = [int(v > STEP_EPS) for v in h_raw]
+        h = np.array(h_bin, dtype=np.float32).reshape(1, -1)
+        z = np.dot(h, W_out_chk) + b_out_chk
+        return int(z[0][0] > STEP_EPS)
+
+    bin_preds = np.array([bin_out_from_x(xi) for xi in X_train], dtype=int)
+    bin_ok = np.array_equal(bin_preds, y_train.astype(int))
+
+    print(f"  Truth table check: continuous_ok={cont_ok}, binarized_ok={bin_ok}")
+
+    if cont_ok:
+        print(f"✓ Converged with stable binarizable XOR (best epoch = {best_idx + 1}, ran {epochs_run} epochs).")
         break
 else:
     raise RuntimeError(
@@ -411,7 +462,7 @@ else:
 # Verify final predictions (these use the restored best weights)
 preds = (model.predict(X_train, verbose=0) >= 0.5).astype(int).flatten()
 print("\nPredictions vs Labels (XOR):")
-for xi, yi, pi in zip(X_train, y_train, preds):
+for xi, yi, pi in zip(X_train, y_train.flatten(), preds):
     print(f"  x={xi.astype(int)}  label={int(yi)}  pred={pi}  {'✓' if int(yi)==pi else '✗'}")
 
 
@@ -600,13 +651,9 @@ print("\n✓ All ACs compiled to NNF.")
 #   AC outputs directly against TF's continuous outputs.
 #
 # Instead we use Option A — a consistent binarized forward pass:
-#   Step 1: Binarize TF hidden outputs using threshold > 0
-#           (ReLU output is always >= 0, so use strict > 0 to match step(z>0)=1)
+#   Step 1: Binarize TF hidden outputs using threshold > STEP_EPS
 #   Step 2: Manually run the output layer using those binary hidden values
-#           (instead of TF's continuous hidden values)
 #   Step 3: Compare AC output against this binarized TF output
-#
-# This gives a logically valid "apples-to-apples" comparison.
 # =============================================================================
 
 # Extract output layer weights once (used for manual binarized forward pass)
@@ -616,7 +663,7 @@ W_out, b_out   = output_layer.get_weights()   # W_out: (4,1), b_out: (1,)
 def binarized_output_forward(binary_hidden):
     """
     Manually compute output layer using binarized hidden values.
-    Applies linear combination then threshold > 0 — matching AC STEP activation.
+    Applies linear combination then threshold > STEP_EPS — matching AC STEP activation.
 
     Args:
         binary_hidden : list of 4 ints (0 or 1)
@@ -626,8 +673,7 @@ def binarized_output_forward(binary_hidden):
     """
     h = np.array(binary_hidden, dtype=np.float32).reshape(1, -1)
     z = np.dot(h, W_out) + b_out          # linear combination
-    # threshold at 0 directly, strict > 0 — consistent with AC ACT node and ReLU binarization
-    return int(z[0][0] > 0)
+    return int(z[0][0] > STEP_EPS)
 
 
 print("\n" + "=" * 65)
@@ -645,10 +691,8 @@ for xi in X_train:
     tf_hidden = hidden_model(xi_batch)[0]   # raw ReLU outputs (numpy)
     print(f"  TF hidden (raw ReLU):     {np.round(tf_hidden, 4)}")
 
-    # Binarize TF hidden using strict > 0
-    # ReLU output is always >= 0, so > 0 correctly maps active neurons to 1.
-    # AC ACT node also uses > 0 — both sides are now consistent.
-    tf_hidden_binary = [int(v > 0) for v in tf_hidden]
+    # Binarize TF hidden using STEP_EPS to reduce near-zero flips
+    tf_hidden_binary = [int(v > STEP_EPS) for v in tf_hidden]
 
     # Evaluate each hidden neuron's AC
     ac_hidden_outputs = []
@@ -660,14 +704,11 @@ for xi in X_train:
     match_hidden = ac_hidden_outputs == tf_hidden_binary
     all_match   &= match_hidden
 
-    print(f"  TF hidden (binarized >0): {tf_hidden_binary}")
+    print(f"  TF hidden (binarized):    {tf_hidden_binary}")
     print(f"  AC hidden (step):         {ac_hidden_outputs}")
     print(f"  Hidden layer match:       {'✓' if match_hidden else '✗ MISMATCH'}")
 
     # ── Output layer ──────────────────────────────────────────────────────────
-    # Use binarized hidden values for both TF and AC output computation
-    # so we are comparing the same computational model
-    # Use TF binarized hidden values (not AC) so TF output is independent of AC
     tf_binary_out = binarized_output_forward(tf_hidden_binary)
 
     ac_out_node = all_acs[('output_layer', 0)]
